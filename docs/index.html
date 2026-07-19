@@ -165,18 +165,53 @@ function bits() {
          (held.has('c')?64:0)|(held.has('s')?128:0);
 }
 
+const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
+async function retryFetch(url, tries = 4) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { const r = await fetch(url); if (r.ok) return r; last = new Error("HTTP " + r.status); }
+    catch (e) { last = e; }
+    await new Promise(r => setTimeout(r, 600 * (i + 1)));
+  }
+  throw last;
+}
+function fallbackToVideo(stage, err) {
+  // graceful degrade: the live engine couldn't load on this network — show it playing
+  const v = document.createElement('video');
+  v.src = "assets/slugline_v2.mp4"; v.autoplay = v.loop = v.muted = v.playsInline = true;
+  v.style.cssText = "position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1";
+  let which = 0;
+  setInterval(() => { which ^= 1; v.src = which ? "assets/ridgeline_v2.mp4" : "assets/slugline_v2.mp4"; v.play(); }, 22000);
+  $('screen-wrap').insertBefore(v, $('overlay'));
+  $('overlay').classList.remove('hide');
+  $('overlay').style.background =
+    "linear-gradient(rgba(11,15,12,.9), rgba(11,15,12,.15) 34%, rgba(11,15,12,.15) 66%, rgba(11,15,12,.9))";
+  $('overlay').style.alignContent = "space-between";
+  $('overlay').innerHTML =
+    `<div style="max-width:92%;padding-top:6px">
+       <div style="font-weight:700;color:var(--amber);font-size:14px">▶ auto-demo (network blocked the runtime)</div>
+     </div>
+     <div style="max-width:92%;padding-bottom:6px">
+       <div class="sub">the games run as real Python (Pyodide, ~20&nbsp;MB) — your network
+         timed out fetching it. try another network / VPN to play them <b style="color:var(--phos)">live</b>,
+         or run locally (see <a href="https://github.com/lixuan27/mission-wm" style="color:var(--phos)">repo</a>).</div>
+       <div class="sub" style="opacity:.5;margin-top:4px">stage: ${stage} · ${String(err).slice(0,80)}</div>
+     </div>`;
+}
 async function boot() {
+  let stage = "pyodide runtime";
   try {
     $('screen-wrap').style.backgroundImage = "url(assets/slugline_v2_poster.jpg)";
-    py = await loadPyodide();
-    $('ov-sub').textContent = "loading numpy…";
+    py = await loadPyodide({ indexURL: PYODIDE_URL });
+    stage = "numpy"; $('ov-sub').textContent = "loading numpy…";
     await py.loadPackage("numpy");
-    $('ov-sub').textContent = "loading the games…";
+    stage = "game files"; $('ov-sub').textContent = "loading the games…";
     py.FS.mkdirTree('/py/game'); py.FS.mkdirTree('/py/racer');
     for (const f of FILES) {
-      const src = await (await fetch(f)).text();
+      const src = await (await retryFetch(f)).text();
       py.FS.writeFile('/' + f, src);
     }
+    stage = "engine import";
     py.runPython(`
 import sys, json
 sys.path.insert(0, '/py')
@@ -212,8 +247,8 @@ def frame(b):
     $('ov-sub').textContent = "pick a game";
     $('screen-wrap').style.backgroundImage = "";
   } catch (err) {
-    $('ov-big').textContent = "LOAD ERROR";
-    $('ov-sub').textContent = String(err).slice(0, 120);
+    console.error("boot failed at", stage, err);
+    fallbackToVideo(stage, err);
   }
 }
 

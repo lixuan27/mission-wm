@@ -1,54 +1,24 @@
-"""Slugline renderer: GameState -> np.uint8[112,160,3] IWBTG-style frame.
+"""Slugline renderer v2: GameState -> np.uint8 [112,160,3], pixel-art edition.
 
-Role: pure-numpy procedural sprites (no assets, no SDL).  High-contrast pixel
-blocks; static level layer is pre-rendered per (level, variant) and cached,
-then dynamic entities + HUD are drawn on top.  Deterministic w.r.t. state.
+Role: draws the v2 art (src/game/sprites.py palette-indexed sprites) over a
+3-layer scene: far parallax (night gradient + stars + moon, scroll 1/4),
+mid parallax (ridge/ruin silhouettes, scroll 1/2), and the tile layer
+(embossed bricks, metal spikes, big exit flag).  Per-(level, camera) composites
+are cached; dynamic entities and HUD are masked sprite blits.
+engine / GameState / collect APIs are untouched; deterministic w.r.t. state.
 """
 
 import numpy as np
 
-from .engine import (FP, TILE, LEVEL_W, LEVEL_H, SCREEN_W, SCREEN_H, PLAYER_W,
-                     PLAYER_H, PLAYER_H_CROUCH, ENEMY_SIZE, A_UP)
+from . import sprites as S
+from .engine import (FP, TILE, LEVEL_W, LEVEL_H, SCREEN_W, SCREEN_H,
+                     WEAPON_CD, MELEE_CD, SIN64, A_UP)
 
-# ---------------------------------------------------------------- palette
-BG_TOP = (24, 26, 40)
-BG_BOT = (34, 38, 58)
-TILE_FILL = (168, 168, 182)
-TILE_EDGE = (92, 92, 108)
-SPIKE_C = (224, 224, 232)
-FLAG_POLE = (180, 180, 190)
-FLAG_C = (70, 220, 90)
-CP_OFF = (232, 210, 64)
-CP_ON = (96, 196, 255)   # distinct from the green exit flag
-PLAYER_BODY = (80, 140, 240)
-PLAYER_HEAD = (240, 220, 190)
-GUN_C = (235, 235, 240)
-WALKER_C = (222, 60, 50)
-WALKER_LEG = (150, 34, 30)
-TURRET_C = (172, 80, 224)
-TURRET_BARREL = (230, 200, 255)
-FLYER_C = (242, 212, 64)
-CRATE_C = (172, 122, 62)
-CRATE_X = (110, 74, 34)
-CAGE_BAR = (150, 150, 160)
-CAPTIVE_C = (244, 152, 172)
-VPLAT_C = (120, 200, 230)
-TRAP_C = (204, 84, 84)
-B_PLAYER = (255, 255, 120)
-B_ROCKET = (255, 140, 40)
-B_ENEMY = (255, 82, 224)
-GRENADE_C = (128, 232, 84)
-EXPL_CORE = (255, 250, 220)
-EXPL_RING = (255, 150, 50)
+# ---------------------------------------------------------------- hud/font
 HUD_BG = (10, 10, 14)
-HEART_C = (235, 50, 60)
 TEXT_C = (240, 240, 245)
-PICKUP_C = {"mg": (80, 220, 235), "rocket": (255, 140, 40),
-            "grenade": (128, 232, 84), "life": (235, 50, 60)}
-WEAPON_ICON = {"pistol": (235, 235, 240), "mg": (80, 220, 235),
-               "rocket": (255, 140, 40)}
 
-# 3x5 bitmap font for digits + dash
+# 3x5 bitmap font for digits + dash (shared with the racer renderer)
 FONT = {
     "0": ("111", "101", "101", "101", "111"),
     "1": ("010", "110", "010", "010", "111"),
@@ -62,8 +32,6 @@ FONT = {
     "9": ("111", "101", "111", "001", "111"),
     "-": ("000", "000", "111", "000", "000"),
 }
-
-_BG_CACHE = {}
 
 
 def _rect(img, x, y, w, h, color):
@@ -86,89 +54,176 @@ def _text(img, x, y, s, color):
         x += 4
 
 
-def _static_layer(state):
-    """Pre-render background + solid tiles + spikes + exit flag for whole level."""
-    key = (state.level_id, state.variant_seed, state.exit_x, hash(tuple(state.tiles)))
-    layer = _BG_CACHE.get(key)
-    if layer is not None:
-        return layer
+# ---------------------------------------------------------------- background
+NIGHT_TOP = (16, 16, 38)
+NIGHT_BOT = (44, 48, 84)
+SIL_C = (20, 20, 40)
+VPLAT_C = (108, 172, 224)
+TRAP_C = (230, 102, 36)
+TRAP_DARK = (120, 52, 22)
+B_PLAYER = (255, 255, 140)
+B_TAIL = (150, 130, 40)
+B_ENEMY = (255, 82, 224)
+B_ETAIL = (130, 40, 110)
+PICKUP_CHIP = {"mg": (108, 172, 224), "rocket": (230, 102, 36),
+               "grenade": (98, 138, 58), "life": (178, 52, 42)}
+WEAPON_ICON = {"pistol": S.ICON_PISTOL, "mg": S.ICON_MG,
+               "rocket": S.ICON_ROCKET}
+
+FAR_W = SCREEN_W + (LEVEL_W * TILE - SCREEN_W) // 4 + 1     # scroll 1/4
+MID_W = SCREEN_W + (LEVEL_W * TILE - SCREEN_W) // 2 + 1     # scroll 1/2
+_CHK = (np.indices((TILE, TILE)).sum(0) % 2 == 0)           # dither checker
+
+_LAYERS = {}          # level key -> dict of parallax + tile strips
+_COMP = {}            # (level key, cam) -> composed background frame
+
+
+def _hash2(a, b):
+    return (a * 73856093 ^ b * 19349663) & 0x7FFFFFFF
+
+
+def _build_layers(state, key):
+    lid = state.level_id
+    # far: night gradient + stars + crescent moon
+    f = np.linspace(0.0, 1.0, SCREEN_H)[:, None]
+    far = (np.asarray(NIGHT_TOP) * (1 - f) + np.asarray(NIGHT_BOT) * f) \
+        .astype(np.uint8)
+    far = np.repeat(far[:, None, :], FAR_W, axis=1)
+    for i in range(46):                                      # deterministic stars
+        h = _hash2(i * 31 + lid * 7, i * 17 + 3)
+        x, y = h % FAR_W, (h >> 8) % 68
+        far[y, x] = (200, 204, 220) if h & 4 else (150, 154, 180)
+        if h & 8 and x + 1 < FAR_W:
+            far[y, x + 1] = (120, 124, 150)
+    S.MOON.draw(far, 24 + lid * 40, 8)
+    # mid: ridge + ruin silhouettes (mask overlay)
+    mid = np.zeros((SCREEN_H, MID_W, 3), dtype=np.uint8)
+    mmask = np.zeros((SCREEN_H, MID_W), dtype=bool)
+    xs = np.arange(MID_W)
+    ridge = 64 - (np.take(np.asarray(SIN64), (xs // 3 + lid * 11) % 64) * 10
+                  // 256) - (np.take(np.asarray(SIN64), (xs // 7 + 20) % 64)
+                             * 6 // 256)
+    for dy in range(SCREEN_H):
+        mmask[dy, ridge <= dy] = True
+    for i in range(6):                                       # ruin towers
+        h = _hash2(lid * 13 + i * 71, i * 29 + 5)
+        tx, tw, th = h % (MID_W - 20), 8 + h % 9, 22 + (h >> 6) % 18
+        top = SCREEN_H - 8 - th
+        mmask[top:, tx:tx + tw] = True
+        if h & 16:                                           # broken-top notch
+            mmask[top:top + 4, tx + tw // 2:tx + tw] = False
+        wy = top + 4 + (h >> 3) % 6
+        wx = tx + 2 + (h >> 9) % max(1, tw - 4)
+        if wy + 2 < SCREEN_H and wx + 1 < MID_W:
+            mmask[wy:wy + 2, wx:wx + 2] = False              # window hole
+    mid[mmask] = SIL_C
+    # tile layer over the full level width (mask overlay)
     w_px = LEVEL_W * TILE
-    layer = np.zeros((SCREEN_H, w_px, 3), dtype=np.uint8)
-    for y in range(SCREEN_H):                                   # vertical gradient
-        f = y / (SCREEN_H - 1)
-        layer[y, :] = [int(a + (b - a) * f) for a, b in zip(BG_TOP, BG_BOT)]
+    til = np.zeros((SCREEN_H, w_px, 3), dtype=np.uint8)
+    tmask = np.zeros((SCREEN_H, w_px), dtype=bool)
     for ty in range(LEVEL_H):
         for tx in range(LEVEL_W):
             ch = state.tiles[ty][tx]
             x, y = tx * TILE, ty * TILE
             if ch == "#":
-                layer[y:y + TILE, x:x + TILE] = TILE_FILL
-                layer[y, x:x + TILE] = TILE_EDGE
-                layer[y + TILE - 1, x:x + TILE] = TILE_EDGE
-                layer[y:y + TILE, x] = TILE_EDGE
-                layer[y:y + TILE, x + TILE - 1] = TILE_EDGE
-            elif ch == "^":                                     # spike triangle
-                for r in range(TILE):
-                    half = (TILE - 1 - r) * TILE // (2 * TILE)  # narrower at top
-                    x0 = x + TILE // 2 - 1 - half
-                    x1 = x + TILE // 2 + 1 + half
-                    layer[y + r, max(0, x0):min(w_px, x1)] = SPIKE_C
-    # exit flag
-    fx = state.exit_x * TILE + 3
-    fy = (LEVEL_H - 1) * TILE
-    layer[fy - 20:fy, fx:fx + 1] = FLAG_POLE
-    layer[fy - 20:fy - 14, fx + 1:fx + 7] = FLAG_C
-    _BG_CACHE[key] = layer
-    return layer
+                til[y:y + TILE, x:x + TILE] = S.BRICK.rgb
+                h = _hash2(tx * 7 + 1, ty * 13 + 1)
+                for j in range(2):                           # per-brick noise
+                    nx = x + 1 + ((h >> (3 * j)) % 6)
+                    ny = y + 1 + ((h >> (3 * j + 7)) % 2) * 4 + j
+                    til[ny, nx] = (110, 112, 126)
+                tmask[y:y + TILE, x:x + TILE] = True
+            elif ch == "^":
+                til[y:y + TILE, x:x + TILE][S.SPIKE.mask] = \
+                    S.SPIKE.rgb[S.SPIKE.mask]
+                tmask[y:y + TILE, x:x + TILE] |= S.SPIKE.mask
+    # big exit flag (anchored on the ground below its column)
+    gty = LEVEL_H
+    for ty in range(LEVEL_H):
+        if state.tiles[ty][state.exit_x] == "#":
+            gty = ty
+            break
+    fx, fy = state.exit_x * TILE - 2, gty * TILE - S.EXIT_FLAG.h
+    x0, y0 = max(0, fx), max(0, fy)
+    sub = S.EXIT_FLAG.mask[:SCREEN_H - y0, :w_px - x0]
+    til[y0:y0 + sub.shape[0], x0:x0 + sub.shape[1]][sub] = \
+        S.EXIT_FLAG.rgb[:sub.shape[0], :sub.shape[1]][sub]
+    tmask[y0:y0 + sub.shape[0], x0:x0 + sub.shape[1]] |= sub
+    _LAYERS[key] = {"far": far, "mmask": mmask, "mid": mid,
+                    "til": til, "tmask": tmask}
+    return _LAYERS[key]
 
 
+def _background(state):
+    """Composite far/mid/tile layers for the current camera (cached)."""
+    key = (state.level_id, state.exit_x, hash(tuple(state.tiles)))
+    cam = state.camera_x
+    comp = _COMP.get((key, cam))
+    if comp is not None:
+        return comp.copy()
+    lay = _LAYERS.get(key) or _build_layers(state, key)
+    img = lay["far"][:, cam // 4:cam // 4 + SCREEN_W].copy()
+    mm = lay["mmask"][:, cam // 2:cam // 2 + SCREEN_W]
+    img[mm] = lay["mid"][:, cam // 2:cam // 2 + SCREEN_W][mm]
+    tm = lay["tmask"][:, cam:cam + SCREEN_W]
+    img[tm] = lay["til"][:, cam:cam + SCREEN_W][tm]
+    if len(_COMP) > 512:
+        _COMP.clear()
+    _COMP[(key, cam)] = img
+    return img.copy()
+
+
+# ---------------------------------------------------------------- render
 def render(state):
     """Render one frame: [112,160,3] uint8."""
     cam = state.camera_x
-    img = _static_layer(state)[:, cam:cam + SCREEN_W].copy()
+    img = _background(state)
     t = state.tick
+    p = state.player
 
-    # checkpoints (dynamic color)
+    # checkpoints (waving flag; green once taken)
     for cp in state.checkpoints:
-        x = cp["x"] - cam + 3
-        y = cp["y"] + TILE
-        _rect(img, x, y - 14, 1, 14, FLAG_POLE)
-        _rect(img, x + 1, y - 14, 5, 4, CP_ON if cp["taken"] else CP_OFF)
+        frames = S.CP_FLAG_TAKEN if cp["taken"] else S.CP_FLAG
+        frames[(t // 8) % 2].draw(img, cp["x"] - cam, cp["y"] - 6)
 
-    # vanishing platforms (flicker while vanishing)
+    # vanishing platforms: solid plank / dithered warning flicker
     for v in state.vplats:
-        if v["state"] == "gone" or (v["state"] == "vanishing" and t % 2 == 0):
+        if v["state"] == "gone":
             continue
-        _rect(img, v["tx"] * TILE - cam, v["ty"] * TILE, TILE, TILE, VPLAT_C)
-        _rect(img, v["tx"] * TILE - cam + 1, v["ty"] * TILE + 1, TILE - 2, 1,
-              (220, 245, 255))
+        x, y = v["tx"] * TILE - cam, v["ty"] * TILE
+        if v["state"] == "solid":
+            _rect(img, x, y, TILE, TILE, VPLAT_C)
+            _rect(img, x, y, TILE, 1, (210, 240, 255))
+            _rect(img, x, y + TILE - 1, TILE, 1, (60, 110, 160))
+        elif 0 <= x <= SCREEN_W - TILE:                     # semi-transparent
+            chk = _CHK if t % 2 == 0 else ~_CHK
+            img[y:y + TILE, x:x + TILE][chk] = VPLAT_C
 
-    # ceiling traps
+    # ceiling traps: riveted blood-orange block with jagged teeth
     for tr in state.traps:
-        c = TRAP_C if tr["state"] != "done" else (120, 60, 60)
-        _rect(img, tr["x"] - cam, tr["y"], tr["w"], tr["h"], c)
-        for i in range(tr["x"], tr["x"] + tr["w"], 4):          # jagged bottom
-            _rect(img, i - cam + 1, tr["y"] + tr["h"], 2, 2, c)
+        c = TRAP_C if tr["state"] != "done" else TRAP_DARK
+        x, y = tr["x"] - cam, tr["y"]
+        _rect(img, x, y, tr["w"], tr["h"], c)
+        _rect(img, x, y, tr["w"], 1, (255, 170, 90))
+        for i in range(0, tr["w"], 4):
+            _rect(img, x + i + 1, y + tr["h"], 2, 2, c)
+            _rect(img, x + i + 1, y + 2, 1, 1, TRAP_DARK)
 
-    # pickups
+    # pickups: supply box + colored chip
     for pk in state.pickups:
         if pk["taken"]:
             continue
-        c = PICKUP_C.get(pk["kind"], TEXT_C)
-        _rect(img, pk["x"] - cam + 1, pk["y"] + 2, 6, 6, c)
-        _rect(img, pk["x"] - cam + 2, pk["y"] + 3, 2, 2, (255, 255, 255))
+        S.PICKUP_BOX.draw(img, pk["x"] - cam, pk["y"])
+        _rect(img, pk["x"] - cam + 2, pk["y"] + 2, 4, 4,
+              PICKUP_CHIP.get(pk["kind"], TEXT_C))
 
-    # cages (grid bars over captive)
+    # cages: wooden grid + waving captive; opened once rescued
     for cg in state.cages:
-        x, y = cg["x"] - cam, cg["y"]
+        x, y = cg["x"] - cam - 1, cg["y"] - 2
         if cg["rescued"]:
-            _rect(img, x, y + 10, 10, 2, CAGE_BAR)              # opened remains
-            continue
-        _rect(img, x + 3, y + 3, 4, 8, CAPTIVE_C)
-        for i in range(0, 11, 3):
-            _rect(img, x + i, y, 1, 12, CAGE_BAR)
-        _rect(img, x, y, 10, 1, CAGE_BAR)
-        _rect(img, x, y + 11, 10, 1, CAGE_BAR)
+            S.CAGE_OPEN.draw(img, x, y)
+        else:
+            S.CAGE[(t // 8) % 2].draw(img, x, y)
 
     # enemies
     for e in state.enemies:
@@ -176,84 +231,88 @@ def render(state):
             continue
         k = e["kind"]
         x, y = e["x"] // FP - cam, e["y"] // FP
-        w, h = ENEMY_SIZE[k]
         if k == "walker":
-            _rect(img, x, y, w, h - 3, WALKER_C)
-            _rect(img, x + 1, y + 1, 2, 2, (255, 200, 200))     # eye
-            ph = (e["x"] // (4 * FP)) % 2                       # leg animation
-            _rect(img, x + (0 if ph else 3), y + h - 3, 3, 3, WALKER_LEG)
+            flip = e["dir"] < 0
+            S.WALKER[(e["x"] // (4 * FP)) % 2].draw(img, x - 2, y - 6, flip)
+            S.GUN_H.draw(img, x + (7 if not flip else -5), y + 1, flip)
         elif k == "turret":
-            _rect(img, x, y + 2, w, h - 2, TURRET_C)
+            S.TURRET.draw(img, x - 2, y - 2)
             bdir = 1 if state.player["x"] > e["x"] else -1
-            _rect(img, x + (w if bdir > 0 else -4), y + h // 2, 4, 2, TURRET_BARREL)
-            _rect(img, x + 2, y, w - 4, 2, TURRET_BARREL)
+            up = 1 if state.player["y"] + 8 * FP < e["y"] else 0
+            _rect(img, x + (8 if bdir > 0 else -4), y - up, 4, 2, (196, 200, 210))
         elif k == "flyer":
-            _rect(img, x + 2, y, w - 4, h, FLYER_C)             # diamond-ish
-            _rect(img, x, y + 2, w, h - 4, FLYER_C)
-            _rect(img, x + w // 2 - 1, y + h // 2 - 1, 2, 2, (120, 90, 20))
-        else:                                                   # crate
-            _rect(img, x, y, w, h, CRATE_C)
-            for i in range(w):
-                yy0, yy1 = y + i * h // w, y + h - 1 - i * h // w
-                if 0 <= x + i < SCREEN_W:
-                    if 0 <= yy0 < SCREEN_H:
-                        img[yy0, x + i] = CRATE_X
-                    if 0 <= yy1 < SCREEN_H:
-                        img[yy1, x + i] = CRATE_X
+            frames = S.FLYER_RED if (e.get("fstate") == "windup" and t % 2 == 0) \
+                else S.FLYER
+            frames[(t // 6) % 2].draw(img, x - 2, y - 2)
+        else:                                               # crate
+            S.PICKUP_BOX.draw(img, x, y)
+            _rect(img, x + 2, y + 2, 4, 4, (138, 94, 52))
 
-    # grenades
+    # grenades (2-frame spin)
     for g in state.grenades:
-        _rect(img, g["x"] // FP - cam - 1, g["y"] // FP - 1, 2, 2, GRENADE_C)
+        S.GRENADE[(t // 3) % 2].draw(img, g["x"] // FP - cam - 1, g["y"] // FP - 1)
 
-    # bullets (bright 2x2; rockets 3x3)
+    # bullets: bright head + fading 1px trail; rockets get sprite + flame
     for b in state.bullets:
         x, y = b["x"] // FP - cam, b["y"] // FP
+        sx = 1 if b["vx"] > 0 else -1 if b["vx"] < 0 else 0
+        sy = 1 if b["vy"] > 0 else -1 if b["vy"] < 0 else 0
         if b["kind"] == "rocket":
-            _rect(img, x - 1, y - 1, 3, 3, B_ROCKET)
-        elif b["kind"] == "enemy":
-            _rect(img, x - 1, y - 1, 2, 2, B_ENEMY)
+            S.ROCKET.draw(img, x - 2, y - 1, flip=b["vx"] < 0)
+            S.ROCKET_FLAME.draw(img, x - 2 - 3 * sx, y - 1, flip=b["vx"] > 0)
         else:
-            _rect(img, x - 1, y - 1, 2, 2, B_PLAYER)
+            hc, tc = (B_ENEMY, B_ETAIL) if b["kind"] == "enemy" \
+                else (B_PLAYER, B_TAIL)
+            _rect(img, x - 1, y - 1, 2, 2, hc)
+            _rect(img, x - 1 - 2 * sx, y - 1 - 2 * sy, 1, 1, tc)
+            _rect(img, x - 1 - 3 * sx, y - 1 - 3 * sy, 1, 1, tc)
 
-    # explosions (expanding ring + core)
+    # explosions: 4-frame anim (white core -> fireball -> smoke)
     for ex in state.explosions:
-        r = (7 - ex["ttl"]) * 2
-        x, y = ex["x"] - cam, ex["y"]
-        _rect(img, x - r, y - r, 2 * r, 2 * r, EXPL_RING)
-        _rect(img, x - r // 2, y - r // 2, r, r, EXPL_CORE)
+        fr = min(3, (6 - ex["ttl"]) * 4 // 6)
+        S.EXPLOSION[fr].draw(img, ex["x"] - cam - 6, ex["y"] - 6)
 
-    # player (block guy with gun barrel; invuln flicker)
-    p = state.player
-    if p["alive"] and not (p["invuln"] > 0 and t % 2 == 0):
-        x = p["x"] // FP - cam
-        crouch = p["crouch"]
-        h = PLAYER_H_CROUCH // FP if crouch else PLAYER_H // FP
-        y = p["y"] // FP + (PLAYER_H - (PLAYER_H_CROUCH if crouch else PLAYER_H)) // FP
-        w = PLAYER_W // FP
-        _rect(img, x, y, w, h, PLAYER_BODY)
-        if not crouch:
-            _rect(img, x + 1, y, w - 2, 3, PLAYER_HEAD)         # head
-        aim_up = state.prev_action[A_UP] and not crouch
-        if aim_up:
-            _rect(img, x + w // 2 - 1, y - 3, 2, 3, GUN_C)      # barrel up
+    # player (12x18 soldier; hitbox 6x12 at sprite offset (3,6))
+    px, py = p["x"] // FP - cam, p["y"] // FP
+    if not p["alive"] and state.death_timer > 0:
+        S.PLAYER_DEAD[0 if state.death_timer > 8 else 1].draw(
+            img, px - 3, py - 6, flip=p["facing"] < 0)
+    elif p["alive"] and not (p["invuln"] > 0 and t % 2 == 0):
+        flip = p["facing"] < 0
+        aim_up = bool(state.prev_action[A_UP]) and not p["crouch"]
+        if p["crouch"]:
+            S.PLAYER_CROUCH.draw(img, px - 3, py + 2, flip)
+        elif not p["on_ground"]:
+            S.PLAYER_JUMP.draw(img, px - 3, py - 6, flip)
+        elif p["vx"] != 0:
+            S.PLAYER_RUN[(p["x"] // (3 * FP)) % 3].draw(img, px - 3, py - 6, flip)
         else:
-            gy = y + (3 if not crouch else 2)
-            _rect(img, x + (w if p["facing"] > 0 else -3), gy, 3, 2, GUN_C)
+            S.PLAYER_STAND.draw(img, px - 3, py - 6, flip)
+        # gun overlay: horizontal / diagonal (up-aim while moving) / vertical
+        if aim_up and p["vx"] != 0:
+            S.GUN_DIAG.draw(img, px + (5 if not flip else -4), py - 3, flip)
+            tipx, tipy = px + (9 if not flip else -5), py - 4
+        elif aim_up:
+            S.GUN_UP.draw(img, px + (2 if not flip else 1), py - 10, flip)
+            tipx, tipy = px + 2, py - 12
+        else:
+            gy = py + (4 if not p["crouch"] else 8)
+            S.GUN_H.draw(img, px + (6 if not flip else -5), gy, flip)
+            tipx, tipy = px + (11 if not flip else -7), gy
+        just_fired = p["shoot_cd"] > 0 and p["shoot_cd"] in (
+            WEAPON_CD.get(p["weapon"], 4), MELEE_CD)
+        if just_fired:
+            S.MUZZLE[t % 2].draw(img, tipx, tipy)
 
-    # HUD top bar
+    # HUD
     img[0:8, :] = HUD_BG
-    for i in range(max(0, state.lives)):                        # hearts
-        _rect(img, 2 + i * 7, 1, 5, 5, HEART_C)
-        if 2 + i * 7 + 2 < SCREEN_W:
-            img[1, 2 + i * 7 + 2] = HUD_BG                      # notch
-    wx = 26                                                     # weapon icon
-    _rect(img, wx, 1, 6, 6, WEAPON_ICON[p["weapon"]])
-    _rect(img, wx + 1, 2, 4, 4, HUD_BG)
-    _rect(img, wx + 2, 3, 2, 2, WEAPON_ICON[p["weapon"]])
+    for i in range(max(0, state.lives)):
+        S.HEART.draw(img, 2 + i * 8, 1)
+    WEAPON_ICON[p["weapon"]].draw(img, 27, 1)
     ammo = p["ammo"].get(p["weapon"], 0)
     ammo_s = "---" if p["weapon"] == "pistol" else str(min(ammo, 999)).rjust(3, "0")
-    _text(img, wx + 8, 1, ammo_s, TEXT_C)
-    _rect(img, 54, 2, 4, 4, GRENADE_C)                          # grenade count
+    _text(img, 37, 1, ammo_s, TEXT_C)
+    S.GRENADE[0].draw(img, 54, 2)
     _text(img, 60, 1, str(min(p["grenades"], 99)).rjust(2, "0"), TEXT_C)
     _text(img, SCREEN_W - 4 - 6 * 4, 1, str(min(state.score, 999999)).rjust(6, "0"),
           TEXT_C)

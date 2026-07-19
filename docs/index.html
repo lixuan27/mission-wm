@@ -131,7 +131,7 @@
   <div style="margin-top:8px">the games run entirely in your browser (Pyodide) — no server, no GPU.</div>
 </footer>
 
-<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script src="pyodide/pyodide.js"></script>
 <script>
 const FILES = [
   "py/game/__init__.py","py/game/engine.py","py/game/render.py",
@@ -165,7 +165,7 @@ function bits() {
          (held.has('c')?64:0)|(held.has('s')?128:0);
 }
 
-const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
+const PYODIDE_URL = "pyodide/";  // self-hosted on the same origin (no external CDN)
 async function retryFetch(url, tries = 4) {
   let last;
   for (let i = 0; i < tries; i++) {

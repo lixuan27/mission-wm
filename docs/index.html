@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MISSION-WM — two tiny games built to be learned</title>
+<meta name="description" content="Play the exact deterministic simulators our world models train on — a run-and-gun platformer and a pseudo-3D racer, running as real Python+NumPy in your browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕹️</text></svg>">
+<style>
+  :root {
+    --bg:#0B0F0C; --panel:#101711; --edge:#1E2B20;
+    --phos:#53F57B;          /* CRT phosphor green */
+    --amber:#FFB444; --alert:#FF4D5E; --dim:#5E7263; --ink:#D9E8DC;
+    color-scheme: dark;
+  }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--ink);
+         font:15px/1.6 ui-monospace, 'Cascadia Mono', Menlo, monospace; }
+  a { color:var(--phos); }
+  .wrap { max-width:900px; margin:0 auto; padding:0 20px; }
+
+  header { text-align:center; padding:64px 0 34px; }
+  .logo { font-size:clamp(30px,6vw,54px); font-weight:700; letter-spacing:.08em;
+          color:var(--phos); text-shadow:0 0 18px rgba(83,245,123,.45); }
+  .logo .wm { color:var(--amber); text-shadow:0 0 18px rgba(255,180,68,.4); }
+  .tag { color:var(--dim); margin-top:10px; font-size:14px; }
+  .tag b { color:var(--ink); font-weight:600; }
+
+  /* cabinet screen */
+  #cab { background:var(--panel); border:1px solid var(--edge); border-radius:16px;
+         padding:22px; margin:26px auto; max-width:560px; }
+  #screen-wrap { position:relative; background:#000; border-radius:8px;
+                 overflow:hidden; line-height:0; }
+  canvas { width:100%; image-rendering:pixelated; display:block; }
+  /* the signature: CRT scanlines + vignette over the live screen */
+  #screen-wrap::after {
+    content:""; position:absolute; inset:0; pointer-events:none; border-radius:8px;
+    background:
+      repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px),
+      radial-gradient(ellipse at center, transparent 58%, rgba(0,0,0,.42) 100%);
+  }
+  #overlay { position:absolute; inset:0; display:grid; place-items:center;
+             background:rgba(11,15,12,.82); z-index:2; text-align:center;
+             font-size:15px; color:var(--phos); }
+  #overlay.hide { display:none; }
+  #overlay .big { font-size:26px; font-weight:700; letter-spacing:.1em;
+                  margin-bottom:10px; animation:blink 1.1s step-end infinite; }
+  @keyframes blink { 50% { opacity:.25; } }
+  @media (prefers-reduced-motion: reduce) { #overlay .big { animation:none; } }
+  #overlay .sub { color:var(--dim); font-size:12.5px; }
+
+  .row { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-top:16px; }
+  button {
+    background:transparent; color:var(--phos); border:1px solid var(--phos);
+    border-radius:6px; padding:9px 18px; font:600 13px ui-monospace, monospace;
+    letter-spacing:.06em; cursor:pointer;
+  }
+  button:hover { background:rgba(83,245,123,.12); }
+  button.amber { color:var(--amber); border-color:var(--amber); }
+  button.amber:hover { background:rgba(255,180,68,.12); }
+  button[disabled] { opacity:.35; cursor:default; }
+  button:focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
+  #keys { text-align:center; color:var(--dim); font-size:12.5px; margin-top:12px; min-height:1.2em; }
+  #keys b { color:var(--ink); }
+  #stat { text-align:center; color:var(--dim); font-size:11.5px; margin-top:6px; }
+
+  section { padding:34px 0 6px; }
+  h2 { color:var(--amber); font-size:15px; letter-spacing:.14em; margin-bottom:12px; }
+  h2::before { content:"» "; color:var(--phos); }
+  p.b { color:var(--ink); max-width:640px; margin:0 auto 10px; }
+  p.d { color:var(--dim); max-width:640px; margin:0 auto 10px; font-size:13.5px; }
+  .center { text-align:center; }
+  .facts { display:flex; gap:26px; justify-content:center; flex-wrap:wrap;
+           margin:18px 0 4px; }
+  .facts div { text-align:center; }
+  .facts .v { color:var(--phos); font-weight:700; font-size:19px; }
+  .facts .k { color:var(--dim); font-size:11.5px; }
+  footer { text-align:center; color:var(--dim); font-size:12.5px; padding:44px 0 60px; }
+  footer a { margin:0 8px; }
+</style>
+</head>
+<body>
+<header class="wrap">
+  <div class="logo">MISSION<span class="wm">-WM</span></div>
+  <div class="tag"><b>Two tiny games built to be learned.</b><br>
+    Play the exact deterministic simulators our neural world models train on —
+    real Python + NumPy, running in your browser.</div>
+</header>
+
+<div id="cab" class="wrap">
+  <div id="screen-wrap">
+    <canvas id="screen" width="160" height="112"></canvas>
+    <div id="overlay"><div>
+      <div class="big" id="ov-big">INSERT COIN</div>
+      <div class="sub" id="ov-sub">loading python runtime…</div>
+    </div></div>
+  </div>
+  <div class="row">
+    <button id="b-slug" disabled>▶ SLUGLINE <span style="opacity:.6">run &amp; gun</span></button>
+    <button id="b-race" class="amber" disabled>▶ RIDGELINE <span style="opacity:.6">2.5D racer</span></button>
+  </div>
+  <div id="keys">arrows move · <b>Z</b> fire · <b>X</b> jump · <b>C</b> grenade · <b>S</b> switch weapon</div>
+  <div id="stat"></div>
+</div>
+
+<section class="wrap center">
+  <h2>WHAT IS THIS</h2>
+  <p class="b">Mission-WM builds <em>model-only</em> game engines: neural networks that
+    generate every frame of a playable game from pixels, player input and their own
+    memory — no simulator in the loop at inference time.</p>
+  <p class="d">These two games are our data engines. Every state is a serializable dict,
+    every run is bit-deterministic, and any moment can be forked into counterfactual
+    branches — the same keys, a different world. That forking supervision
+    (branch-consistency), an event-memory ledger (lives / ammo / kills, RAM-supervised
+    in training, self-predicted at inference) and a legal-action red-team metric
+    (BreakLength) are the research agenda. The neural twins of both games are
+    training now; when they land, you'll play them here, side by side with these originals.</p>
+  <div class="facts">
+    <div><div class="v">2</div><div class="k">games, one pipeline</div></div>
+    <div><div class="v">712k</div><div class="k">frames collected (game 1)</div></div>
+    <div><div class="v">9×</div><div class="k">counterfactual branches per fork</div></div>
+    <div><div class="v">175k</div><div class="k">engine ticks/sec (native)</div></div>
+  </div>
+</section>
+
+<footer class="wrap">
+  MIT · <a href="https://github.com/lixuan27/mission-wm">code</a>
+  <a href="https://github.com/lixuan27/butterfly">sister project: butterfly</a>
+  <a href="https://lixuan27.github.io/butterfly/">butterfly site</a>
+  <div style="margin-top:8px">the games run entirely in your browser (Pyodide) — no server, no GPU.</div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const FILES = [
+  "py/game/__init__.py","py/game/engine.py","py/game/render.py",
+  "py/game/levels.py","py/game/policies.py",
+  "py/racer/__init__.py","py/racer/engine.py","py/racer/render.py",
+  "py/racer/levels.py","py/racer/policies.py",
+];
+const KEYMAPS = {
+  slug: "arrows move · <b>Z</b> fire · <b>X</b> jump · <b>C</b> grenade · <b>S</b> switch weapon",
+  race: "<b>←→</b> steer · <b>↑</b> accelerate · <b>↓</b> brake · <b>Z</b> nitro",
+};
+const $ = id => document.getElementById(id);
+const ctx = $('screen').getContext('2d');
+const img = ctx.createImageData(160, 112);
+let py = null, game = null, level = 1, timer = null, frames = 0, t0 = 0;
+const held = new Set();
+addEventListener('keydown', e => {
+  if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
+  held.add(e.key.toLowerCase());
+  if (e.key === "Enter" && game && !$('overlay').classList.contains('hide')) start(game, level);
+});
+addEventListener('keyup', e => held.delete(e.key.toLowerCase()));
+
+function bits() {
+  const L = held.has('arrowleft'), R = held.has('arrowright');
+  const U = held.has('arrowup'), D = held.has('arrowdown');
+  if (game === 'race')
+    return (L?1:0)|(R?2:0)|(U?4:0)|(D?8:0)|(held.has('z')?16:0);
+  return (L||held.has('a')?1:0)|(R||held.has('d')?2:0)|(U||held.has('w')?4:0)|
+         (D?8:0)|(held.has('z')?16:0)|(held.has('x')?32:0)|
+         (held.has('c')?64:0)|(held.has('s')?128:0);
+}
+
+async function boot() {
+  try {
+    py = await loadPyodide();
+    $('ov-sub').textContent = "loading numpy…";
+    await py.loadPackage("numpy");
+    $('ov-sub').textContent = "loading the games…";
+    py.FS.mkdirTree('/py/game'); py.FS.mkdirTree('/py/racer');
+    for (const f of FILES) {
+      const src = await (await fetch(f)).text();
+      py.FS.writeFile('/' + f, src);
+    }
+    py.runPython(`
+import sys, json
+sys.path.insert(0, '/py')
+import numpy as np
+from game.levels import make_level as sl_make
+from game.engine import step as sl_step
+from game.render import render as sl_render
+from racer.levels import make_level as rc_make
+from racer.engine import step as rc_step
+from racer.render import render as rc_render
+_state = None; _game = None
+
+def start(game, level):
+    global _state, _game
+    _game = game
+    _state = sl_make(level) if game == 'slug' else rc_make(level)
+
+def frame(b):
+    global _state
+    if _game == 'slug':
+        act = ((b>>0)&1,(b>>1)&1,(b>>2)&1,(b>>3)&1,(b>>4)&1,(b>>5)&1,(b>>6)&1,(b>>7)&1)
+        _state, _ = sl_step(_state, act)
+        fr = sl_render(_state)
+    else:
+        act = ((b>>0)&1,(b>>1)&1,(b>>2)&1,(b>>3)&1,(b>>4)&1,0,0,0)
+        _state, _ = rc_step(_state, act)
+        fr = rc_render(_state)
+    status = 1 if _state.level_clear else (2 if _state.game_over else 0)
+    return bytes(fr.tobytes()) + bytes([status])
+`);
+    $('b-slug').disabled = $('b-race').disabled = false;
+    $('ov-big').textContent = "READY";
+    $('ov-sub').textContent = "pick a game";
+  } catch (err) {
+    $('ov-big').textContent = "LOAD ERROR";
+    $('ov-sub').textContent = String(err).slice(0, 120);
+  }
+}
+
+function start(g, lv) {
+  game = g; level = lv; frames = 0; t0 = performance.now();
+  $('keys').innerHTML = KEYMAPS[g];
+  py.globals.get('start')(g, lv);
+  $('overlay').classList.add('hide');
+  if (timer) clearInterval(timer);
+  timer = setInterval(tick, 50);           // 20 ticks/s, matches the engine
+}
+
+function tick() {
+  const proxy = py.globals.get('frame')(bits());
+  const buf = proxy.toJs(); proxy.destroy();
+  const status = buf[buf.length - 1];
+  const px = img.data;
+  for (let i = 0, j = 0; i < 160 * 112; i++) {
+    px[i*4] = buf[j++]; px[i*4+1] = buf[j++]; px[i*4+2] = buf[j++]; px[i*4+3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  frames++;
+  if (frames % 20 === 0)
+    $('stat').textContent = `${(frames / ((performance.now()-t0)/1000)).toFixed(1)} fps · ${game === 'slug' ? 'SLUGLINE L'+level : 'RIDGELINE'} · engine runs live in your tab`;
+  if (status) {
+    clearInterval(timer); timer = null;
+    if (status === 1 && game === 'slug' && level < 3) {
+      $('ov-big').textContent = "STAGE CLEAR";
+      $('ov-sub').textContent = "ENTER = next level";
+      level += 1;
+    } else if (status === 1) {
+      $('ov-big').textContent = game === 'slug' ? "ALL CLEAR!" : "FINISH!";
+      $('ov-sub').textContent = "ENTER = play again";
+      if (game === 'slug') level = 1;
+    } else {
+      $('ov-big').textContent = "GAME OVER";
+      $('ov-sub').textContent = "ENTER = retry";
+    }
+    $('overlay').classList.remove('hide');
+  }
+}
+
+$('b-slug').onclick = () => start('slug', 1);
+$('b-race').onclick = () => start('race', 1);
+boot();
+</script>
+</body>
+</html>

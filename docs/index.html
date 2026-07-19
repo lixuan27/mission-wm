@@ -39,8 +39,9 @@
       repeating-linear-gradient(0deg, rgba(0,0,0,.16) 0 1px, transparent 1px 3px),
       radial-gradient(ellipse at center, transparent 58%, rgba(0,0,0,.42) 100%);
   }
+  #screen-wrap { background:#000 center/cover no-repeat; }
   #overlay { position:absolute; inset:0; display:grid; place-items:center;
-             background:rgba(11,15,12,.82); z-index:2; text-align:center;
+             background:rgba(11,15,12,.72); z-index:2; text-align:center;
              font-size:15px; color:var(--phos); }
   #overlay.hide { display:none; }
   #overlay .big { font-size:26px; font-weight:700; letter-spacing:.1em;
@@ -166,6 +167,7 @@ function bits() {
 
 async function boot() {
   try {
+    $('screen-wrap').style.backgroundImage = "url(assets/slugline_v2_poster.jpg)";
     py = await loadPyodide();
     $('ov-sub').textContent = "loading numpy…";
     await py.loadPackage("numpy");
@@ -208,6 +210,7 @@ def frame(b):
     $('b-slug').disabled = $('b-race').disabled = false;
     $('ov-big').textContent = "READY";
     $('ov-sub').textContent = "pick a game";
+    $('screen-wrap').style.backgroundImage = "";
   } catch (err) {
     $('ov-big').textContent = "LOAD ERROR";
     $('ov-sub').textContent = String(err).slice(0, 120);

@@ -4,6 +4,13 @@
 deterministic simulators our neural world models train on, running as real
 Python + NumPy in your tab (Pyodide). No server, no GPU.
 
+| SLUGLINE (run & gun) | RIDGELINE (2.5D racer) |
+|---|---|
+| ![slugline](docs/assets/slugline_v2_poster.jpg) | ![ridgeline](docs/assets/ridgeline_v2_poster.jpg) |
+
+*(gameplay clips: [`docs/assets/slugline_v2.mp4`](docs/assets/slugline_v2.mp4) ·
+[`docs/assets/ridgeline_v2.mp4`](docs/assets/ridgeline_v2.mp4))*
+
 - **SLUGLINE** — an IWBTG-flavored run-and-gun: 3 weapons, grenades, spikes,
   hostages, checkpoints, 3 stages.
 - **RIDGELINE** — an OutRun-style pseudo-3D racer: curvature/hill scanline

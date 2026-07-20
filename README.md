@@ -23,6 +23,12 @@ action, event (hit/kill/pickup/rescue/crash/overtake…) and state variable
 (lives/ammo/score/speed). One collector produces action-labeled frames plus
 **9-way counterfactual forks** from any moment — the same past, a different key.
 
+## 📖 Read: why neural games ignore your buttons
+
+We trained neural nets to *be* the game engine and found they systematically ignore
+player input — a clean, measured "action marginalization" result. Full write-up with
+evidence: **[blog](https://lixuan27.github.io/mission-wm/blog.html)**.
+
 ## Why
 
 Mission-WM builds *model-only* game engines — neural networks that generate a
